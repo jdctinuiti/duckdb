@@ -5,6 +5,8 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
+#include "duckdb/common/enums/database_modification_type.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "test_helpers.hpp"
 
 using namespace duckdb;
@@ -84,6 +86,38 @@ TEST_CASE("duckdb_tables only fetches requested metadata", "[catalog]") {
 		REQUIRE(CHECK_COLUMN(result, 0, {1}));
 		REQUIRE(calls.storage == 0);
 		REQUIRE(calls.sql == 0);
+	}
+
+	SECTION("Database filtering skips metadata in other catalogs while projection stays lazy") {
+		CatalogMetadataCalls ignored_calls;
+		REQUIRE_NO_FAIL(con.Query("ATTACH ':memory:' AS ignored"));
+		con.context->RunFunctionInTransaction([&]() {
+			auto &schema = Catalog::GetSchema(*con.context, "ignored", "main").Cast<DuckSchemaEntry>();
+			MetaTransaction::Get(*con.context)
+			    .ModifyDatabase(schema.catalog.GetAttached(), DatabaseModificationType::CREATE_CATALOG_ENTRY);
+			CreateTableInfo info(schema, "ignored_table");
+			info.columns.AddColumn(ColumnDefinition("i", LogicalType::INTEGER));
+			info.columns.Finalize();
+			auto entry = make_uniq<CountingTableEntry>(schema.catalog, schema, info, ignored_calls);
+			REQUIRE(schema.AddEntry(schema.GetCatalogTransaction(*con.context), std::move(entry),
+			                        OnCreateConflict::ERROR_ON_CONFLICT));
+		});
+		ignored_calls.storage = 0;
+		ignored_calls.sql = 0;
+		auto result = con.Query("SELECT estimated_size FROM duckdb_tables() WHERE database_name = 'temp'");
+		REQUIRE(CHECK_COLUMN(result, 0, {42}));
+		REQUIRE(calls.storage == 1);
+		REQUIRE(calls.sql == 0);
+		REQUIRE(ignored_calls.storage == 0);
+		REQUIRE(ignored_calls.sql == 0);
+		calls.storage = 0;
+		result = con.Query("SELECT table_name FROM duckdb_tables() WHERE database_name = 'temp'");
+		REQUIRE(CHECK_COLUMN(result, 0, {"counting_table"}));
+		REQUIRE(calls.storage == 0);
+		REQUIRE(calls.sql == 0);
+		REQUIRE(ignored_calls.storage == 0);
+		REQUIRE(ignored_calls.sql == 0);
+		REQUIRE_NO_FAIL(con.Query("DETACH ignored"));
 	}
 
 	SECTION("Both storage columns share one request, including repeated projections") {
