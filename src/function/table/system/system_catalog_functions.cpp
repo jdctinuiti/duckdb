@@ -37,20 +37,21 @@ SystemCatalogScanFunction::GetSchemas(ClientContext &context, optional_ptr<const
 		return Catalog::GetAllSchemas(context);
 	}
 
-	auto database = DatabaseManager::Get(context).GetDatabase(context, data.catalog);
-	if (!database || database->GetName() != data.catalog || database->GetVisibility() == AttachVisibility::HIDDEN) {
+	auto database = DatabaseManager::Get(context).GetDatabase(context, Identifier(data.catalog));
+	if (!database || database->GetName().GetIdentifierName() != data.catalog ||
+	    database->GetVisibility() == AttachVisibility::HIDDEN) {
 		return {};
 	}
 	return database->GetCatalog().GetSchemas(context);
 }
 
 static bool IsDatabaseNameColumn(const LogicalGet &get, const BoundColumnRefExpression &ref) {
-	if (ref.binding.table_index != get.table_index) {
+	if (ref.Binding().table_index != get.table_index) {
 		return false;
 	}
 	const auto &column_ids = get.GetColumnIds();
-	if (ref.binding.column_index < column_ids.size()) {
-		const auto &col_idx = column_ids[ref.binding.column_index];
+	if (ref.Binding().column_index < column_ids.size()) {
+		const auto &col_idx = column_ids[ref.Binding().column_index];
 		if (col_idx.HasPrimaryIndex()) {
 			return get.GetColumnName(col_idx) == SystemCatalogScanFunction::DATABASE_NAME_COLUMN;
 		}
@@ -59,33 +60,35 @@ static bool IsDatabaseNameColumn(const LogicalGet &get, const BoundColumnRefExpr
 }
 
 static bool TryExtractDatabaseNameEquality(const LogicalGet &get, const Expression &expr, string &catalog) {
-	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COMPARISON) {
+	if (!BoundComparisonExpression::IsComparison(expr)) {
 		return false;
 	}
-	auto &comp = expr.Cast<BoundComparisonExpression>();
+	auto &comp = expr.Cast<BoundFunctionExpression>();
 	if (comp.GetExpressionType() != ExpressionType::COMPARE_EQUAL) {
 		return false;
 	}
 
+	auto &left = BoundComparisonExpression::Left(comp);
+	auto &right = BoundComparisonExpression::Right(comp);
 	const BoundColumnRefExpression *column_ref = nullptr;
 	const BoundConstantExpression *constant = nullptr;
-	if (comp.left->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-	    comp.right->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
-		column_ref = &comp.left->Cast<BoundColumnRefExpression>();
-		constant = &comp.right->Cast<BoundConstantExpression>();
-	} else if (comp.left->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
-	           comp.right->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-		column_ref = &comp.right->Cast<BoundColumnRefExpression>();
-		constant = &comp.left->Cast<BoundConstantExpression>();
+	if (left.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+	    right.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		column_ref = &left.Cast<BoundColumnRefExpression>();
+		constant = &right.Cast<BoundConstantExpression>();
+	} else if (left.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+	           right.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		column_ref = &right.Cast<BoundColumnRefExpression>();
+		constant = &left.Cast<BoundConstantExpression>();
 	} else {
 		return false;
 	}
 
-	if (!IsDatabaseNameColumn(get, *column_ref) || constant->value.IsNull() ||
-	    constant->value.type().id() != LogicalTypeId::VARCHAR) {
+	if (!IsDatabaseNameColumn(get, *column_ref) || constant->GetValue().IsNull() ||
+	    constant->GetValue().type().id() != LogicalTypeId::VARCHAR) {
 		return false;
 	}
-	catalog = StringValue::Get(constant->value);
+	catalog = StringValue::Get(constant->GetValue());
 	return !catalog.empty();
 }
 
