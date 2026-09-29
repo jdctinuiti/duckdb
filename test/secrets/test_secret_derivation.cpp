@@ -176,3 +176,70 @@ TEST_CASE("A failed derivation errors and leaves the secret marked", "[secret][.
 	REQUIRE(LookupToken(db, secret_manager) == "token_2");
 	REQUIRE(derivation_count == 2);
 }
+
+TEST_CASE("Derived credentials are visible across open transactions", "[secret][refresh]") {
+	derivation_count = 0;
+	derivation_fails = false;
+	DuckDB db(nullptr);
+	RegisterDerivationTestSecret(*db.instance);
+	auto &secret_manager = SecretManager::Get(*db.instance);
+	Connection outer(db);
+	REQUIRE_NO_FAIL(outer.Query("CREATE SECRET s1 (TYPE derivation_test, SCOPE 'dt://', "
+	                            "REFRESH_INFO MAP {'account': 'acct'})"));
+	outer.BeginTransaction();
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(*outer.context);
+	auto match = secret_manager.LookupSecret(transaction, "dt://bucket/file", SECRET_TYPE);
+	REQUIRE(match.HasMatch());
+	auto &secret = match.GetSecret().Cast<KeyValueSecret>();
+	REQUIRE(secret.TryGetValue("token").ToString() == "token_1");
+	secret.MarkMustRefresh();
+	REQUIRE(secret_manager.TryRefreshSecret(*outer.context, secret));
+
+	// An extension's internal connection must see the refresh before the outer transaction commits.
+	REQUIRE(LookupToken(db, secret_manager) == "token_2");
+	REQUIRE(derivation_count == 2);
+	outer.Rollback();
+	REQUIRE(LookupToken(db, secret_manager) == "token_2");
+
+	// Explicit SQL replacement retains its transactional visibility and rollback semantics.
+	outer.BeginTransaction();
+	REQUIRE_NO_FAIL(outer.Query("CREATE OR REPLACE SECRET s1 (TYPE derivation_test, SCOPE 'dt://', "
+	                            "REFRESH_INFO MAP {'account': 'replacement'})"));
+	REQUIRE(LookupToken(db, secret_manager) == "token_2");
+	outer.Rollback();
+	REQUIRE(LookupToken(db, secret_manager) == "token_2");
+}
+
+TEST_CASE("Derived credentials refresh from an older catalog snapshot", "[secret][refresh]") {
+	derivation_count = 0;
+	derivation_fails = false;
+	DuckDB db(nullptr);
+	RegisterDerivationTestSecret(*db.instance);
+	auto &secret_manager = SecretManager::Get(*db.instance);
+	Connection writer(db);
+	Connection stale(db);
+	REQUIRE_NO_FAIL(writer.Query("CREATE SECRET s1 (TYPE derivation_test, SCOPE 'dt://', "
+	                             "REFRESH_INFO MAP {'account': 'original'})"));
+	stale.BeginTransaction();
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(*stale.context);
+	auto match = secret_manager.LookupSecret(transaction, "dt://bucket/file", SECRET_TYPE);
+	REQUIRE(match.HasMatch());
+	auto &secret = match.GetSecret().Cast<KeyValueSecret>();
+	REQUIRE(secret.TryGetValue("token").ToString() == "token_1");
+
+	REQUIRE_NO_FAIL(writer.Query("CREATE OR REPLACE SECRET s1 (TYPE derivation_test, SCOPE 'dt://', "
+	                             "REFRESH_INFO MAP {'account': 'replacement'})"));
+	secret.MarkMustRefresh();
+	REQUIRE(secret_manager.TryRefreshSecret(*stale.context, secret));
+	REQUIRE(secret.TryGetValue("token").ToString() == "token_3");
+	// Refreshing the visible catalog version must not overwrite a newer, explicitly replaced secret.
+	REQUIRE(LookupToken(db, secret_manager) == "token_2");
+	auto refreshed_match = secret_manager.LookupSecret(transaction, "dt://bucket/file", SECRET_TYPE);
+	REQUIRE(refreshed_match.GetSecret().Cast<KeyValueSecret>().TryGetValue("token").ToString() == "token_3");
+	REQUIRE(derivation_count == 3);
+	auto replacement = stale.Query("CREATE OR REPLACE SECRET s1 (TYPE derivation_test, SCOPE 'dt://')");
+	REQUIRE_FAIL(replacement);
+	REQUIRE(StringUtil::Contains(replacement->GetError(), "Catalog write-write conflict"));
+	stale.Rollback();
+	REQUIRE(LookupToken(db, secret_manager) == "token_2");
+}
