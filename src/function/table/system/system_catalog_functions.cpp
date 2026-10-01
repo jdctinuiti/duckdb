@@ -125,7 +125,7 @@ InsertionOrderPreservingMap<string> SystemCatalogScanFunction::ToString(TableFun
 }
 
 void SystemCatalogScanFunction::Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
-                                          const TableFunction &) {
+                                          const BoundTableFunction &) {
 	string catalog;
 	if (bind_data) {
 		catalog = bind_data->Cast<SystemCatalogScanBindData>().catalog;
@@ -133,7 +133,7 @@ void SystemCatalogScanFunction::Serialize(Serializer &serializer, const optional
 	serializer.WritePropertyWithDefault<string>(100, "catalog", catalog);
 }
 
-unique_ptr<FunctionData> SystemCatalogScanFunction::Deserialize(Deserializer &deserializer, TableFunction &) {
+unique_ptr<FunctionData> SystemCatalogScanFunction::Deserialize(Deserializer &deserializer, BoundTableFunction &) {
 	auto result = make_uniq<SystemCatalogScanBindData>();
 	deserializer.ReadPropertyWithDefault<string>(100, "catalog", result->catalog);
 	return std::move(result);
