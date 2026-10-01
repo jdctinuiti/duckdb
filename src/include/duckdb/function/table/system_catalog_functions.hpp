@@ -32,8 +32,8 @@ struct SystemCatalogScanFunction {
 	                                  vector<unique_ptr<Expression>> &filters);
 	static InsertionOrderPreservingMap<string> ToString(TableFunctionToStringInput &input);
 	static void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
-	                      const TableFunction &function);
-	static unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, TableFunction &function);
+	                      const BoundTableFunction &function);
+	static unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunction &function);
 	static void Register(TableFunction &function);
 };
 
