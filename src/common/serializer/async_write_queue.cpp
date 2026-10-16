@@ -1684,7 +1684,7 @@ void ManagedAsyncWriteStreamQueue::AbortWrites() {
 		local_error_ref = local_error;
 	}
 	write_queue->DiscardExternalPendingBytes(discarded_bytes, discarded_allocation_size);
-	// A completion may already have decided to refill and be waiting for submission_lock.
+	// After closing and discarding, release the lock before draining completions that may be waiting to refill.
 	submission_guard.unlock();
 	try {
 		write_queue->AbortWrites();
