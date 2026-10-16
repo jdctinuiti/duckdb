@@ -68,13 +68,22 @@ public:
 		return queue.closed;
 	}
 
+	static idx_t PendingBytes(ManagedAsyncWriteStreamQueue &queue) {
+		annotated_lock_guard<annotated_mutex> guard(queue.lock);
+		return queue.pending_bytes;
+	}
+
 	static bool TryCompletionRefill(ManagedAsyncWriteStreamQueue &queue) {
-		// Fail rather than hang if abort holds the publication lock while draining this completion.
-		if (!queue.submission_lock.try_lock()) {
-			return false;
+		// Bound the wait so the broken lock order fails instead of hanging this completion.
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (!queue.submission_lock.try_lock()) {
+			if (std::chrono::steady_clock::now() >= deadline) {
+				return false;
+			}
+			std::this_thread::yield();
 		}
 		queue.submission_lock.unlock();
-		queue.SchedulePendingWrites();
+		queue.SchedulePendingWritesInternal();
 		return true;
 	}
 
@@ -1357,19 +1366,25 @@ TEST_CASE("ManagedAsyncWriteStreamQueue abort permits an in-flight completion re
 	SequentialAsyncWriteStreamTarget stream_target(target, true);
 	ManagedAsyncWriteStreamQueue queue(*con->context, stream_target);
 	auto &underlying_queue = ManagedAsyncWriteQueueTest::UnderlyingQueue(queue);
+	REQUIRE(underlying_queue.IsAsync());
 	mutex completion_lock;
 	std::condition_variable completion_cv;
 	bool completion_entered = false;
 	bool release_completion = false;
-	bool refill_finished = false;
+	atomic<bool> completion_released {false};
+	atomic<bool> refill_finished {false};
+	// Stand in for a completion that already selected a refill before the stream was closed.
 	auto completion = [&](idx_t, idx_t, optional_ptr<const ErrorData>) {
 		{
 			unique_lock<mutex> guard(completion_lock);
 			completion_entered = true;
 			completion_cv.notify_all();
-			completion_cv.wait(guard, [&]() { return release_completion; });
+			completion_released =
+			    completion_cv.wait_for(guard, std::chrono::seconds(5), [&]() { return release_completion; });
 		}
-		refill_finished = ManagedAsyncWriteQueueTest::TryCompletionRefill(queue);
+		if (completion_released) {
+			refill_finished = ManagedAsyncWriteQueueTest::TryCompletionRefill(queue);
+		}
 	};
 	underlying_queue.RegisterWrite(AsyncWriteRequest(make_uniq<StringAsyncWriteBuffer>("abc"), 0, completion));
 	bool entered_completion;
@@ -1379,14 +1394,18 @@ TEST_CASE("ManagedAsyncWriteStreamQueue abort permits an in-flight completion re
 		    completion_cv.wait_for(guard, std::chrono::seconds(5), [&]() { return completion_entered; });
 	}
 
+	queue.RegisterWrite(make_uniq<StringAsyncWriteBuffer>("pending"), 0,
+	                    ManagedAsyncWriteStreamQueue::ScheduleMode::DEFER);
+	auto pending_bytes = ManagedAsyncWriteQueueTest::PendingBytes(queue);
+
 	string abort_error;
 	std::thread abort_thread([&]() { abort_error = CaptureException([&]() { queue.AbortWrites(); }); });
-	// The underlying queue closes only once the stream has discarded its pending writes and started draining.
+	// Closing the underlying queue follows closing the stream and discarding its pending writes.
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-	bool draining = false;
+	bool underlying_closed = false;
 	while (std::chrono::steady_clock::now() < deadline) {
 		if (ManagedAsyncWriteQueueTest::IsClosed(underlying_queue)) {
-			draining = true;
+			underlying_closed = true;
 			break;
 		}
 		std::this_thread::yield();
@@ -1399,10 +1418,13 @@ TEST_CASE("ManagedAsyncWriteStreamQueue abort permits an in-flight completion re
 	abort_thread.join();
 
 	REQUIRE(entered_completion);
-	REQUIRE(draining);
+	REQUIRE(underlying_closed);
+	REQUIRE(completion_released);
 	REQUIRE(refill_finished);
+	REQUIRE(pending_bytes == 7);
 	REQUIRE(abort_error.empty());
-	REQUIRE(ManagedAsyncWriteQueueTest::RetainedBytes(queue) == 0);
+	REQUIRE(ManagedAsyncWriteQueueTest::PendingBytes(queue) == 0);
+	REQUIRE(ManagedAsyncWriteQueueTest::ExternalPendingBytes(underlying_queue) == 0);
 	REQUIRE(target.write_sizes == vector<idx_t> {3});
 }
 
