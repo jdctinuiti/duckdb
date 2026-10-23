@@ -1,11 +1,11 @@
 #include "duckdb/optimizer/remove_unused_columns.hpp"
 
 #include "duckdb/common/assert.hpp"
-#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/pair.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/scalar/struct_functions.hpp"
+#include "duckdb/function/scalar/variant_functions.hpp"
 #include "duckdb/function/builtin_function_lookup.hpp"
 #include "duckdb/parser/parsed_data/vacuum_info.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -668,6 +668,9 @@ void RemoveUnusedColumns::VisitOperator(unique_ptr<LogicalOperator> &op_ref) {
 			return;
 		}
 		if (setop.setop_all && !everything_referenced) {
+			if (TryPushdownUnionExtracts(setop)) {
+				return;
+			}
 			// for UNION we can remove unreferenced columns if union all is used
 			// it's possible not all columns are referenced, but unreferenced columns in the union can
 			// still have an affect on the result of the union
@@ -1115,31 +1118,32 @@ void RemoveUnusedColumns::WritePushdownExtractColumns(
 static unique_ptr<Expression> ConstructStructExtractFromPath(ClientContext &context, unique_ptr<Expression> target,
                                                              const ColumnIndex &path) {
 	auto &struct_type = target->GetReturnType();
-	D_ASSERT(struct_type.id() == LogicalTypeId::STRUCT);
+	D_ASSERT(struct_type.id() == LogicalTypeId::STRUCT || struct_type.id() == LogicalTypeId::VARIANT);
 	reference<const LogicalType> type_iter(struct_type);
 	reference<const ColumnIndex> path_iter(path);
 	while (true) {
-		if (!path_iter.get().HasPrimaryIndex()) {
-			// TODO: Reconstruct named field steps with variant_extract to support mixed STRUCT/VARIANT paths.
-			throw BinderException("Extracting VARIANT field \"%s\" through this projection is not supported",
-			                      path_iter.get().GetFieldName());
-		}
-		auto child_index = path_iter.get().GetPrimaryIndex();
-		auto &child_types = StructType::GetChildTypes(type_iter.get());
-		D_ASSERT(child_index < child_types.size());
-		auto is_unnamed = StructType::IsUnnamed(type_iter.get());
-
-		type_iter = child_types[child_index].second;
-
 		vector<unique_ptr<Expression>> arguments(2);
 		arguments[0] = (std::move(target));
-		if (is_unnamed) {
-			arguments[1] = make_uniq<BoundConstantExpression>(Value::BIGINT(NumericCast<int64_t>(child_index + 1)));
+		if (type_iter.get().id() == LogicalTypeId::VARIANT) {
+			// a VARIANT field is addressed by key, and is itself a VARIANT
+			arguments[1] = make_uniq<BoundConstantExpression>(Value(path_iter.get().GetFieldName()));
+			target = BindBuiltinScalarFunction(context, VariantExtractFun::Name, std::move(arguments));
 		} else {
-			arguments[1] = make_uniq<BoundConstantExpression>(Value(child_types[child_index].first));
+			auto child_index = path_iter.get().GetPrimaryIndex();
+			auto &child_types = StructType::GetChildTypes(type_iter.get());
+			D_ASSERT(child_index < child_types.size());
+			auto is_unnamed = StructType::IsUnnamed(type_iter.get());
+
+			type_iter = child_types[child_index].second;
+
+			if (is_unnamed) {
+				arguments[1] = make_uniq<BoundConstantExpression>(Value::BIGINT(NumericCast<int64_t>(child_index + 1)));
+			} else {
+				arguments[1] = make_uniq<BoundConstantExpression>(Value(child_types[child_index].first));
+			}
+			// the constant argument selects the key or the index overload of struct_extract
+			target = BindBuiltinScalarFunction(context, StructExtractFun::Name, std::move(arguments));
 		}
-		// the struct_extract set holds both the key and the index overload, the constant argument selects between them
-		target = BindBuiltinScalarFunction(context, StructExtractFun::Name, std::move(arguments));
 		if (!path_iter.get().HasChildren()) {
 			break;
 		}
@@ -1203,13 +1207,50 @@ void RemoveUnusedColumns::RewriteExpressions(LogicalProjection &proj, idx_t expr
 	proj.expressions = std::move(expressions);
 }
 
-template <class T>
-static bool OnlyStructFieldPaths(const T &paths) {
-	for (auto &path : paths) {
-		if (!path.HasPrimaryIndex() || !OnlyStructFieldPaths(path.GetChildIndexes())) {
-			return false;
+bool RemoveUnusedColumns::TryPushdownUnionExtracts(LogicalSetOperation &setop) {
+	D_ASSERT(setop.setop_all && !everything_referenced && mode == RemoveUnusedColumnsMode::APPLY);
+	setop.ResolveOperatorTypes();
+	auto original_bindings = setop.children[0]->GetColumnBindings();
+	vector<unique_ptr<Expression>> expressions;
+	for (idx_t i = 0; i < setop.column_count; i++) {
+		expressions.push_back(make_uniq<BoundColumnRefExpression>(setop.types[i], original_bindings[i]));
+	}
+	// Build one output layout, then apply the same extracts to every branch.
+	LogicalProjection projection(setop.table_index, std::move(expressions));
+	CheckPushdownExtract(projection);
+	bool has_extracts = false;
+	for (idx_t i = 0; i < setop.column_count; i++) {
+		auto entry = column_references.find(ColumnBinding(setop.table_index, ProjectionIndex(i)));
+		if (entry != column_references.end() &&
+		    entry->second.supports_pushdown_extract == PushdownExtractSupport::ENABLED) {
+			has_extracts = true;
+			break;
 		}
 	}
+	if (!has_extracts) {
+		return false;
+	}
+	ClearUnusedExpressions(projection.expressions, setop.table_index);
+	RewriteExpressions(projection, setop.column_count);
+	ApplySecureViewReplacements();
+	for (auto &child : setop.children) {
+		vector<unique_ptr<Expression>> branch_expressions;
+		for (auto &expression : projection.expressions) {
+			branch_expressions.push_back(expression->Copy());
+		}
+		auto branch = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(branch_expressions));
+		ColumnBindingReplacer replacer;
+		replacer.AddReplacements(original_bindings, child->GetColumnBindings());
+		replacer.VisitOperatorBindings(*branch);
+		if (child->has_estimated_cardinality) {
+			branch->SetEstimatedCardinality(child->estimated_cardinality);
+		}
+		branch->children.push_back(std::move(child));
+		child = std::move(branch);
+		RemoveUnusedColumns remove(*this, true);
+		remove.VisitOperator(child);
+	}
+	setop.column_count = projection.expressions.size();
 	return true;
 }
 
@@ -1276,12 +1317,9 @@ void RemoveUnusedColumns::CheckPushdownExtract(LogicalOperator &op) {
 				//! Not a column reference, can't pull up the extract
 				continue;
 			}
-			if (expr.GetReturnType().id() != LogicalTypeId::STRUCT) {
-				//! Extract pull up only supported for STRUCT currently
-				continue;
-			}
-			if (!OnlyStructFieldPaths(col.unique_paths)) {
-				//! A VARIANT field step cannot be rebuilt as a struct extract above the projection
+			if (expr.GetReturnType().id() != LogicalTypeId::STRUCT &&
+			    expr.GetReturnType().id() != LogicalTypeId::VARIANT) {
+				//! Only nested column references support extract pushdown
 				continue;
 			}
 			if (col.supports_pushdown_extract == PushdownExtractSupport::DISABLED) {
@@ -1793,10 +1831,14 @@ void ReferencedColumn::AddPath(const ColumnIndex &path) {
 	}
 
 	//! No parent path exists, but child paths could already be added, remove them if they exist
+	//! A child is only removed if the new path matches it - a path with different type information does not
+	column_index_set new_path_set;
+	new_path_set.emplace(path);
 	auto it = unique_paths.begin();
 	for (; it != unique_paths.end();) {
 		auto &unique_path = *it;
-		if (unique_path.IsChildPathOf(path)) {
+		if (unique_path.IsChildPathOf(path) &&
+		    FindShortestMatchingPath(new_path_set, unique_path).first != new_path_set.end()) {
 			auto current = it;
 			it++;
 			unique_paths.erase(current);
