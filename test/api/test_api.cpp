@@ -1079,7 +1079,7 @@ TEST_CASE("Test internal connections follow the interrupts of their base client"
 			std::this_thread::sleep_for(std::chrono::milliseconds(200));
 			con.Interrupt();
 		});
-		auto result = con.Query("FROM destroy_external_resource('slow_deleter', 1)");
+		auto result = child.Query("FROM slow_deleter(1)");
 		interrupter.join();
 		REQUIRE(result->HasError());
 		REQUIRE(std::chrono::steady_clock::now() - start < std::chrono::seconds(30));
